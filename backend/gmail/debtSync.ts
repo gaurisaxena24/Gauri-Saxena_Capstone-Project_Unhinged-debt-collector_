@@ -35,9 +35,14 @@ import {
   type Person,
 } from "../database/database.js";
 
-/** Bounded and cheap — this is a targeted single-debt check, not a broad scan. All candidates are
- * fetched in parallel, so this costs one round trip, not 25. */
-const MAX_CANDIDATE_MESSAGES = 25;
+/** Bounded — this is a targeted single-debt check, not a broad scan. Each search below may page past
+ * Gmail's first page (so a busy inbox can't crowd the payment email out of view), up to this many
+ * emails in total across all searches. */
+const MAX_CANDIDATE_MESSAGES = 75;
+/** Gmail's per-page cap for messages.list. */
+const GMAIL_PAGE_SIZE = 100;
+/** Messages are fetched this many at a time, to stay under Gmail's per-user rate limit. */
+const FETCH_CHUNK_SIZE = 25;
 
 /** At most this many in-window emails go to the (slow, rate-limited) AI fallback. */
 const MAX_AI_FALLBACK_MESSAGES = 5;
@@ -57,9 +62,11 @@ const DAY_MS = 24 * 60 * 60 * 1000;
  * never a real difference like ₹850 vs ₹851. */
 const AMOUNT_EPSILON = 0.005;
 
+/** Words that mean money is arriving. Deliberately leaves out words like "sent", "payment" and
+ * "transaction", which appear in almost every order receipt, OTP and newsletter — with them, a busy
+ * inbox filled every result slot with unrelated mail and the real payment email was never looked at. */
 const PAYMENT_LANGUAGE_TERMS = [
-  "paid", "payment", "received", "credited", "transferred", "sent", "settled", "repaid", "returned",
-  "transaction", "UPI", '"bank transfer"', '"payment successful"',
+  "credited", "received", '"paid you"', '"sent you"', "repaid", "settled", "UPI", '"bank transfer"',
 ];
 
 interface GmailMessageListItem {
@@ -84,14 +91,27 @@ interface GmailMessage {
   };
 }
 
-async function listCandidateMessages(accessToken: string, query: string): Promise<GmailMessageListItem[]> {
-  const url = new URL("https://gmail.googleapis.com/gmail/v1/users/me/messages");
-  url.searchParams.set("q", query);
-  url.searchParams.set("maxResults", String(MAX_CANDIDATE_MESSAGES));
-  const res = await fetch(url.toString(), { headers: { Authorization: `Bearer ${accessToken}` } });
-  if (!res.ok) throw new Error(`Gmail messages.list failed (${res.status})`);
-  const body = await res.json();
-  return body.messages ?? [];
+/** Up to `limit` message ids for `query`, following Gmail's page tokens past the first page. */
+async function listCandidateMessages(
+  accessToken: string,
+  query: string,
+  limit: number
+): Promise<GmailMessageListItem[]> {
+  const out: GmailMessageListItem[] = [];
+  let pageToken: string | undefined;
+  while (out.length < limit) {
+    const url = new URL("https://gmail.googleapis.com/gmail/v1/users/me/messages");
+    url.searchParams.set("q", query);
+    url.searchParams.set("maxResults", String(Math.min(GMAIL_PAGE_SIZE, limit - out.length)));
+    if (pageToken) url.searchParams.set("pageToken", pageToken);
+    const res = await fetch(url.toString(), { headers: { Authorization: `Bearer ${accessToken}` } });
+    if (!res.ok) throw new Error(`Gmail messages.list failed (${res.status})`);
+    const body = await res.json();
+    out.push(...(body.messages ?? []));
+    pageToken = body.nextPageToken;
+    if (!pageToken) break;
+  }
+  return out;
 }
 
 function decodeBase64Url(data: string): string {
@@ -183,14 +203,66 @@ function buildDateWindowQuery(window: DateWindow): string {
   return `after:${fmt(window.startMs - DAY_MS)} before:${fmt(window.endMs + DAY_MS)}`;
 }
 
-/** Payment words OR any part of the person's name — so a plain "here's the 850 I owe you" from Raj,
- * with no payment keyword at all, is still a candidate. */
-function buildSearchTerms(person: Person): string {
+/** Groups digits the Western way (1,250,000) and the Indian way (12,50,000) — both show up in emails. */
+function withThousandsSeparators(intPart: string): string[] {
+  if (intPart.length <= 3) return [];
+  const western = intPart.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  const last3 = intPart.slice(-3);
+  const indian = `${intPart.slice(0, -3).replace(/\B(?=(\d{2})+(?!\d))/g, ",")},${last3}`;
+  return [...new Set([western, indian])];
+}
+
+/** Every way the debt amount is likely written in an email: 850 / 850.00 / 1,250 / 204.99 / 204.5. */
+function buildAmountTerms(amount: number): string {
+  const fixed = amount.toFixed(2);
+  const [intPart, decimals] = fixed.split(".");
+  const forms = new Set<string>();
+  const addWithSeparators = (suffix: string) => {
+    forms.add(`${intPart}${suffix}`);
+    for (const grouped of withThousandsSeparators(intPart)) forms.add(`${grouped}${suffix}`);
+  };
+  if (decimals === "00") addWithSeparators("");
+  addWithSeparators(`.${decimals}`);
+  if (decimals.endsWith("0") && decimals !== "00") addWithSeparators(`.${decimals[0]}`);
+  return `(${[...forms].map((f) => `"${f}"`).join(" OR ")})`;
+}
+
+/** Any part of the person's name — so a plain "here's the 850 I owe you" from Raj, with no payment
+ * keyword at all, is still a candidate. Null if the name has no usable part. */
+function buildNameTerms(person: Person): string | null {
   const nameParts = person.name
     .split(/\s+/)
     .map((p) => p.replace(/[^\p{L}\p{N}]/gu, ""))
     .filter((p) => p.length >= 3);
-  return `(${[...PAYMENT_LANGUAGE_TERMS, ...nameParts.map((p) => `"${p}"`)].join(" OR ")})`;
+  return nameParts.length > 0 ? `(${nameParts.map((p) => `"${p}"`).join(" OR ")})` : null;
+}
+
+/** The searches Sync runs, most specific first: the exact amount (almost always finds the payment
+ * email in one short list), then the person's name, then payment-arriving words. Results are merged
+ * in this order, so the likeliest emails are checked first. */
+function buildSearchQueries(dateQuery: string, person: Person, amount: number): string[] {
+  const nameTerms = buildNameTerms(person);
+  return [
+    `${dateQuery} ${buildAmountTerms(amount)}`,
+    ...(nameTerms ? [`${dateQuery} ${nameTerms}`] : []),
+    `${dateQuery} (${PAYMENT_LANGUAGE_TERMS.join(" OR ")})`,
+  ];
+}
+
+/** Runs each search in order and merges the ids (no duplicates), up to MAX_CANDIDATE_MESSAGES. */
+async function findCandidateMessages(accessToken: string, queries: string[]): Promise<GmailMessageListItem[]> {
+  const seen = new Set<string>();
+  const merged: GmailMessageListItem[] = [];
+  for (const query of queries) {
+    const remaining = MAX_CANDIDATE_MESSAGES - merged.length;
+    if (remaining <= 0) break;
+    for (const item of await listCandidateMessages(accessToken, query, remaining)) {
+      if (seen.has(item.id)) continue;
+      seen.add(item.id);
+      merged.push(item);
+    }
+  }
+  return merged.slice(0, MAX_CANDIDATE_MESSAGES);
 }
 
 export interface DebtSyncResult {
@@ -242,18 +314,22 @@ export async function syncDebtAgainstGmail(params: {
   const window = buildDateWindow(expenseDate, debt.created_at);
   if (!window) return noMatchResult("This debt has no usable date to match a payment email against.");
 
-  const query = `${buildDateWindowQuery(window)} ${buildSearchTerms(person)}`;
-  const candidates = await listCandidateMessages(accessToken, query);
+  const queries = buildSearchQueries(buildDateWindowQuery(window), person, debt.amount);
+  const candidates = await findCandidateMessages(accessToken, queries);
 
-  // All fetched at once (Gmail returns newest first, and that order is kept).
-  const fetched = await Promise.all(
-    candidates.map(({ id }) =>
-      fetchMessage(accessToken, id).catch((error) => {
-        console.error(`[debt-sync] Failed to fetch Gmail message ${id} for debt ${debt.id}:`, error);
-        return null;
-      })
-    )
-  );
+  // Fetched in parallel chunks, keeping the most-specific-search-first order.
+  const fetched: (FetchedMessage | null)[] = [];
+  for (let i = 0; i < candidates.length; i += FETCH_CHUNK_SIZE) {
+    const chunk = await Promise.all(
+      candidates.slice(i, i + FETCH_CHUNK_SIZE).map(({ id }) =>
+        fetchMessage(accessToken, id).catch((error) => {
+          console.error(`[debt-sync] Failed to fetch Gmail message ${id} for debt ${debt.id}:`, error);
+          return null;
+        })
+      )
+    );
+    fetched.push(...chunk);
+  }
 
   // Signal 2 (date) — the exact check against when Gmail actually received each email.
   const inWindow = fetched.filter(
